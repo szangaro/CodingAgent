@@ -1,45 +1,47 @@
 """
-Complete example: pick up a real Jira ticket, draft a fix for a repo
+Complete example: pick up a real GitHub issue, draft a fix for a repo
 checked out locally on disk, get a HUMAN's approval on the plan before
 any code is written, get an LLM reviewer's approval on the code before
-anything is pushed, then open a draft PR and comment back on the ticket.
+anything is pushed, then open a draft PR and comment back on the issue.
 
 Requires (see requirements.txt and README.md):
-  ANTHROPIC_API_KEY, GITHUB_PAT, JIRA_URL, JIRA_USERNAME, JIRA_API_TOKEN
+  ANTHROPIC_API_KEY, GITHUB_PAT
 
 repo_path must point at an existing local clone that already has an
 `origin` remote with push access configured (SSH key, credential helper,
 whatever you normally use for `git push` -- this pipeline doesn't manage
-git auth, only the MCP calls). GITHUB_PAT is still needed because opening
-a PR is an API-only action; git has no equivalent for it.
+git auth, only the MCP calls). The issue and the PR are assumed to live
+in the same repo (pr_owner/pr_repo) -- GITHUB_PAT needs read access to
+issues and write access to contents/PRs there.
 
 Flow
 ----
-fetch_context   pull the real ticket (Jira) + read the current file, if
-                any, straight off disk at repo_path/file_path
+fetch_context   pull the real issue (title + body) + read the current
+                file, if any, straight off disk at repo_path/file_path
 planner         draft a plan from that real context
 plan_gate       STOP. A human looks at the plan before anything else happens.
                   reject -> planner drafts again (up to MAX_PLAN_ROUNDS),
-                            then plan_rejected: comment on the ticket, end.
+                            then plan_rejected: comment on the issue, end.
                   approve -> coder
 coder           write the complete new file content
-reviewer        an LLM checks the code against the ticket and plan
+reviewer        an LLM checks the code against the issue and plan
                   reject -> coder retries (up to MAX_REVIEW_ROUNDS),
-                            then flag_for_human: comment on the ticket, end.
+                            then flag_for_human: comment on the issue, end.
                   approve -> open_pr
 open_pr         plain local git: checkout base_branch, branch, write the
                 file, commit, push -- then open a DRAFT PR via the GitHub
-                API (the one step git can't do) and comment the PR link
-                back on the ticket
+                API (the one step git can't do), with "Closes #<issue>" in
+                the body so merging it closes the issue automatically, and
+                comment the PR link back on the issue
 
 So there are two separate gates before anything lands on GitHub: yours
 (before code exists at all) and the reviewer's (before it's pushed). A
 human approving the plan is not the same as the code passing review --
 both have to happen.
 
-Where the ticket goes: bottom of this file, in main() -- change
-jira_ticket_key / pr_owner / pr_repo / repo_path / file_path there, or
-call run_with_console_approval({...}) yourself with different values.
+Where the issue goes: bottom of this file, in main() -- change
+issue_number / pr_owner / pr_repo / repo_path / file_path there, or call
+run_with_console_approval({...}) yourself with different values.
 
 Where you review the plan: printed to the console by
 run_with_console_approval(), which is the only part of this file that's
@@ -49,15 +51,13 @@ it doesn't change.
 
 Tool-name provenance (so nothing here is a guess): reading the file,
 branching, and pushing are all plain `git` -- no MCP tool involved. The
-only GitHub MCP tool left is create_pull_request, and add_issue_comment
-for Jira never went away; both names were checked against the current
-github-mcp-server README, not assumed from an older API shape. The Jira
-tool names (jira_get_issue, jira_add_comment, jira_get_transitions,
-jira_transition_issue) were confirmed by actually running mcp-atlassian
-locally and listing its tools -- listing a tool's schema doesn't require
-working credentials, only calling one does. One thing that's best-effort
-rather than guaranteed: matching a Jira transition by name
-(workflow-specific by nature, silently skipped if nothing matches).
+GitHub MCP tool names used (get_issue, add_issue_comment,
+create_pull_request, update_issue) were checked against the current
+github-mcp-server README, not assumed from an older API shape. One thing
+that's best-effort rather than guaranteed: applying an "in review" label
+after the PR opens -- it re-fetches current labels and merges rather than
+overwriting them, but update_issue's exact label semantics can vary by
+server version, so it's silently skipped if the call fails.
 """
 
 import asyncio
@@ -79,10 +79,10 @@ AGENTS_DIR = Path(__file__).parent / "agents"
 MODEL_NAME = "claude-sonnet-4-5-20250929"
 MAX_REVIEW_ROUNDS = 3
 MAX_PLAN_ROUNDS = 3
-# Jira transition names to try (in order) after a PR is opened. Workflow-
-# specific -- adjust to your project's board, or ignore: it's skipped
-# entirely if nothing matches.
-TRANSITION_NAME_CANDIDATES = ["in review", "code review", "review"]
+# Label applied to the issue after a PR opens -- best-effort, see
+# open_pr_node. Change to match your repo's labels, or ignore: it's
+# skipped entirely if the update call fails.
+IN_REVIEW_LABEL = "in review"
 
 
 def load_instructions(name: str) -> str:
@@ -111,26 +111,18 @@ TOOLS: dict[str, Any] = {}
 
 
 def build_mcp_client() -> MultiServerMCPClient:
+    # Every MCP call in this pipeline goes through this one server now:
+    # get_issue / add_issue_comment / update_issue for the issue, and
+    # create_pull_request for the PR. Reading the file, branching,
+    # committing, and pushing are all local git against repo_path instead
+    # (see _run_git / open_pr_node).
     return MultiServerMCPClient(
         {
-            # Only create_pull_request is called from this server now --
-            # reading the file, branching, committing, and pushing are all
-            # local git against repo_path (see _run_git / open_pr_node).
             "github": {
                 "transport": "streamable_http",
                 "url": "https://api.githubcopilot.com/mcp/",
                 "headers": {
                     "Authorization": f"Bearer {os.environ.get('GITHUB_PAT', '')}"
-                },
-            },
-            "jira": {
-                "transport": "stdio",
-                "command": "mcp-atlassian",  # pip install mcp-atlassian
-                "args": [],
-                "env": {
-                    "JIRA_URL": os.environ.get("JIRA_URL", ""),
-                    "JIRA_USERNAME": os.environ.get("JIRA_USERNAME", ""),
-                    "JIRA_API_TOKEN": os.environ.get("JIRA_API_TOKEN", ""),
                 },
             },
         }
@@ -188,13 +180,13 @@ def _extract_pr_url(result: Any) -> str:
 
 
 class PipelineState(TypedDict):
-    jira_ticket_key: str
     pr_owner: str
     pr_repo: str
+    issue_number: int
     repo_path: str
     base_branch: str
     file_path: str
-    ticket_summary: str
+    issue_summary: str
     existing_content: str
     plan: str
     plan_approved: bool
@@ -208,32 +200,35 @@ class PipelineState(TypedDict):
     escalated: bool
 
 
-# --- fetch real context: the ticket via MCP, the file straight off disk
-# (no LLM involved -- we already know exactly which ticket/file, there's
+# --- fetch real context: the issue via MCP, the file straight off disk
+# (no LLM involved -- we already know exactly which issue/file, there's
 # nothing to decide) ---
 async def fetch_context_node(state: PipelineState) -> dict:
-    ticket_raw = await TOOLS["jira_get_issue"].ainvoke(
-        {"issue_key": state["jira_ticket_key"], "comment_limit": 0}
+    issue_raw = await TOOLS["get_issue"].ainvoke(
+        {
+            "owner": state["pr_owner"],
+            "repo": state["pr_repo"],
+            "issue_number": state["issue_number"],
+        }
     )
-    ticket = json.loads(_tool_text(ticket_raw))
-    fields = ticket.get("fields", ticket)
-    ticket_summary = (
-        f"{state['jira_ticket_key']}: {fields.get('summary', '')}\n\n"
-        f"{fields.get('description', '')}"
+    issue = json.loads(_tool_text(issue_raw))
+    issue_summary = (
+        f"#{state['issue_number']}: {issue.get('title', '')}\n\n"
+        f"{issue.get('body') or ''}"
     )
 
     target = Path(state["repo_path"]) / state["file_path"]
-    # File doesn't exist on disk yet -- the ticket is asking for something
+    # File doesn't exist on disk yet -- the issue is asking for something
     # new, not a fix to something already there.
     existing_content = target.read_text() if target.exists() else ""
 
-    return {"ticket_summary": ticket_summary, "existing_content": existing_content}
+    return {"issue_summary": issue_summary, "existing_content": existing_content}
 
 
 async def planner_node(state: PipelineState) -> dict:
     system = cached_system_message(load_instructions("planner"))
     parts = [
-        f"Ticket:\n{state['ticket_summary']}",
+        f"Issue:\n{state['issue_summary']}",
         f"Current file ({state['file_path']}, empty if new):\n"
         f"{state['existing_content'] or '(file does not exist yet)'}",
     ]
@@ -252,8 +247,8 @@ async def plan_gate_node(state: PipelineState) -> dict:
     decision = interrupt(
         {
             "kind": "plan_approval",
-            "ticket_key": state["jira_ticket_key"],
-            "ticket_summary": state["ticket_summary"],
+            "issue_number": state["issue_number"],
+            "issue_summary": state["issue_summary"],
             "file_path": state["file_path"],
             "plan": state["plan"],
             "round": state.get("plan_round", 0) + 1,
@@ -277,7 +272,7 @@ def route_after_gate(state: PipelineState) -> Literal["coder", "planner", "abort
 async def coder_node(state: PipelineState) -> dict:
     system = cached_system_message(load_instructions("coder"))
     parts = [
-        f"Ticket:\n{state['ticket_summary']}",
+        f"Issue:\n{state['issue_summary']}",
         f"Plan:\n{state['plan']}",
         f"Current file ({state['file_path']}, empty if new):\n"
         f"{state['existing_content'] or '(file does not exist yet)'}",
@@ -296,7 +291,7 @@ async def reviewer_node(state: PipelineState) -> dict:
     system = cached_system_message(load_instructions("reviewer"))
     human = HumanMessage(
         content=(
-            f"Ticket:\n{state['ticket_summary']}\n\n"
+            f"Issue:\n{state['issue_summary']}\n\n"
             f"Plan:\n{state['plan']}\n\n"
             f"Proposed file:\n{state['code']}"
         )
@@ -322,10 +317,10 @@ def route_after_review(state: PipelineState) -> Literal["retry", "publish", "esc
 
 # --- approved by both gates: branch, commit, and push locally, then open
 # the PR (the one step that has to go through the GitHub API) and tell
-# the ticket ---
+# the issue ---
 async def open_pr_node(state: PipelineState) -> dict:
     repo_path = Path(state["repo_path"])
-    branch_name = f"agent/{state['jira_ticket_key'].lower()}"
+    branch_name = f"agent/issue-{state['issue_number']}"
 
     _run_git(repo_path, "checkout", state["base_branch"])
     _run_git(repo_path, "pull", "origin", state["base_branch"])
@@ -337,51 +332,72 @@ async def open_pr_node(state: PipelineState) -> dict:
     target.write_text(code)
 
     _run_git(repo_path, "add", state["file_path"])
-    _run_git(repo_path, "commit", "-m", f"{state['jira_ticket_key']}: automated fix")
+    _run_git(repo_path, "commit", "-m", f"#{state['issue_number']}: automated fix")
     _run_git(repo_path, "push", "-u", "origin", branch_name)
 
     pr_raw = await TOOLS["create_pull_request"].ainvoke(
         {
             "owner": state["pr_owner"],
             "repo": state["pr_repo"],
-            "title": f"{state['jira_ticket_key']}: automated fix",
+            "title": f"#{state['issue_number']}: automated fix",
             "head": branch_name,
             "base": state["base_branch"],
-            "body": f"Closes {state['jira_ticket_key']}\n\n{state['plan']}",
+            # "Closes #N" is a GitHub closing keyword -- merging this PR
+            # closes the issue automatically, no separate API call needed.
+            "body": f"Closes #{state['issue_number']}\n\n{state['plan']}",
             "draft": True,  # a human still reviews before this merges
         }
     )
     pr_url = _extract_pr_url(pr_raw)
 
-    await TOOLS["jira_add_comment"].ainvoke(
-        {"issue_key": state["jira_ticket_key"], "body": f"Opened draft PR: {pr_url}"}
+    await TOOLS["add_issue_comment"].ainvoke(
+        {
+            "owner": state["pr_owner"],
+            "repo": state["pr_repo"],
+            "issue_number": state["issue_number"],
+            "body": f"Opened draft PR: {pr_url}",
+        }
     )
 
-    if "jira_get_transitions" in TOOLS and "jira_transition_issue" in TOOLS:
+    if "update_issue" in TOOLS:
         try:
-            transitions_raw = await TOOLS["jira_get_transitions"].ainvoke(
-                {"issue_key": state["jira_ticket_key"]}
+            # Re-fetch so we merge into whatever labels are on the issue
+            # right now instead of overwriting them -- update_issue's
+            # labels field replaces the full set, it doesn't append.
+            fresh_raw = await TOOLS["get_issue"].ainvoke(
+                {
+                    "owner": state["pr_owner"],
+                    "repo": state["pr_repo"],
+                    "issue_number": state["issue_number"],
+                }
             )
-            transitions = json.loads(_tool_text(transitions_raw))
-            items = transitions.get("transitions", transitions if isinstance(transitions, list) else [])
-            for t in items:
-                name = str(t.get("name", "")).lower()
-                if any(candidate in name for candidate in TRANSITION_NAME_CANDIDATES):
-                    await TOOLS["jira_transition_issue"].ainvoke(
-                        {"issue_key": state["jira_ticket_key"], "transition_id": str(t["id"])}
-                    )
-                    break
+            fresh = json.loads(_tool_text(fresh_raw))
+            current_labels = [
+                label.get("name", label) if isinstance(label, dict) else label
+                for label in fresh.get("labels", [])
+            ]
+            if IN_REVIEW_LABEL not in current_labels:
+                await TOOLS["update_issue"].ainvoke(
+                    {
+                        "owner": state["pr_owner"],
+                        "repo": state["pr_repo"],
+                        "issue_number": state["issue_number"],
+                        "labels": current_labels + [IN_REVIEW_LABEL],
+                    }
+                )
         except Exception:
             pass  # best-effort -- the PR + comment already happened
 
     return {"pr_url": pr_url}
 
 
-# --- reviewer never converged: tell the ticket, touch nothing on GitHub ---
+# --- reviewer never converged: tell the issue, touch nothing on GitHub ---
 async def flag_for_human_node(state: PipelineState) -> dict:
-    await TOOLS["jira_add_comment"].ainvoke(
+    await TOOLS["add_issue_comment"].ainvoke(
         {
-            "issue_key": state["jira_ticket_key"],
+            "owner": state["pr_owner"],
+            "repo": state["pr_repo"],
+            "issue_number": state["issue_number"],
             "body": (
                 f"Automated attempt did not pass review after "
                 f"{state['review_round']} round(s). No branch or PR was "
@@ -392,11 +408,13 @@ async def flag_for_human_node(state: PipelineState) -> dict:
     return {"escalated": True}
 
 
-# --- plan never approved by YOU: tell the ticket, touch nothing on GitHub ---
+# --- plan never approved by YOU: tell the issue, touch nothing on GitHub ---
 async def plan_rejected_node(state: PipelineState) -> dict:
-    await TOOLS["jira_add_comment"].ainvoke(
+    await TOOLS["add_issue_comment"].ainvoke(
         {
-            "issue_key": state["jira_ticket_key"],
+            "owner": state["pr_owner"],
+            "repo": state["pr_repo"],
+            "issue_number": state["issue_number"],
             "body": (
                 f"Proposed plan was rejected {state['plan_round']} time(s) "
                 f"and never approved. No code was written. Last feedback:\n\n"
@@ -458,9 +476,9 @@ async def run_with_console_approval(initial_state: dict) -> dict:
 
         payload = result["__interrupt__"][0].value
         print("\n" + "=" * 70)
-        print(f"{payload['ticket_key']} -- plan (round {payload['round']}), file: {payload['file_path']}")
+        print(f"#{payload['issue_number']} -- plan (round {payload['round']}), file: {payload['file_path']}")
         print("=" * 70)
-        print(payload["ticket_summary"])
+        print(payload["issue_summary"])
         print("-" * 70)
         print(payload["plan"])
         print("=" * 70)
@@ -474,24 +492,24 @@ async def run_with_console_approval(initial_state: dict) -> dict:
 
 
 async def main():
-    required = ["ANTHROPIC_API_KEY", "GITHUB_PAT", "JIRA_URL", "JIRA_USERNAME", "JIRA_API_TOKEN"]
+    required = ["ANTHROPIC_API_KEY", "GITHUB_PAT"]
     missing = [v for v in required if not os.environ.get(v)]
     if missing:
         raise SystemExit(f"Set these env vars first: {', '.join(missing)}")
 
     await setup_tools()
 
-    # <-- the ticket and repo go here --
+    # <-- the issue and repo go here --
     result = await run_with_console_approval(
         {
-            "jira_ticket_key": "PROJ-123",  # change to a real ticket key
             "pr_owner": "your-org",
             "pr_repo": "your-repo",
+            "issue_number": 123,  # change to a real issue number
             "repo_path": "/path/to/local/clone",  # existing checkout with
             # an `origin` remote you already have push access to
             "base_branch": "main",
             "file_path": "src/example.py",  # which file the fix touches --
-            # locating this automatically from the ticket alone (code
+            # locating this automatically from the issue alone (code
             # search, stack-trace parsing) is a separate, harder problem
             # not solved here; this takes it as a given on purpose.
             "plan_round": 0,

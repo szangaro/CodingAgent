@@ -3,4 +3,3 @@ langchain-anthropic
 langchain-core
 mcp
 langchain-mcp-adapters
-mcp-atlassian
