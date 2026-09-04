@@ -51,13 +51,15 @@ it doesn't change.
 
 Tool-name provenance (so nothing here is a guess): reading the file,
 branching, and pushing are all plain `git` -- no MCP tool involved. The
-GitHub MCP tool names used (get_issue, add_issue_comment,
-create_pull_request, update_issue) were checked against the current
-github-mcp-server README, not assumed from an older API shape. One thing
-that's best-effort rather than guaranteed: applying an "in review" label
-after the PR opens -- it re-fetches current labels and merges rather than
-overwriting them, but update_issue's exact label semantics can vary by
-server version, so it's silently skipped if the call fails.
+GitHub MCP tool names used (issue_read with method="get",
+add_issue_comment, create_pull_request, issue_write with method="update")
+were confirmed by actually listing the live server's tools and their
+input schemas, not assumed from docs or an older API shape -- issue_read
+and issue_write are themselves a consolidation of what used to be
+separate get_issue/update_issue-style tools. One thing that's best-effort
+rather than guaranteed: applying an "in review" label after the PR opens
+-- it re-fetches current labels and merges rather than overwriting them,
+but is silently skipped if the call fails.
 """
 
 import asyncio
@@ -168,6 +170,14 @@ def _run_git(repo_path: Path, *args: str) -> str:
     return result.stdout
 
 
+def _log(message: str) -> None:
+    """Progress logging -- plain stdout, not terminal-specific UI (unlike
+    the plan-approval prompt in run_with_console_approval, this has no
+    input() and prints the same whether you're watching a terminal or
+    piping stdout to a log file)."""
+    print(f"[pipeline] {message}", flush=True)
+
+
 def _extract_pr_url(result: Any) -> str:
     raw = _tool_text(result)
     try:
@@ -204,8 +214,10 @@ class PipelineState(TypedDict):
 # (no LLM involved -- we already know exactly which issue/file, there's
 # nothing to decide) ---
 async def fetch_context_node(state: PipelineState) -> dict:
-    issue_raw = await TOOLS["get_issue"].ainvoke(
+    _log(f"fetching issue #{state['issue_number']} from {state['pr_owner']}/{state['pr_repo']}...")
+    issue_raw = await TOOLS["issue_read"].ainvoke(
         {
+            "method": "get",
             "owner": state["pr_owner"],
             "repo": state["pr_repo"],
             "issue_number": state["issue_number"],
@@ -221,11 +233,18 @@ async def fetch_context_node(state: PipelineState) -> dict:
     # File doesn't exist on disk yet -- the issue is asking for something
     # new, not a fix to something already there.
     existing_content = target.read_text() if target.exists() else ""
+    _log(
+        f"got issue #{state['issue_number']}: {issue.get('title', '')!r}; "
+        f"{state['file_path']} "
+        + ("exists on disk" if existing_content else "does not exist yet")
+    )
 
     return {"issue_summary": issue_summary, "existing_content": existing_content}
 
 
 async def planner_node(state: PipelineState) -> dict:
+    round_no = state.get("plan_round", 0) + 1
+    _log(f"planner: drafting plan (round {round_no})...")
     system = cached_system_message(load_instructions("planner"))
     parts = [
         f"Issue:\n{state['issue_summary']}",
@@ -239,6 +258,7 @@ async def planner_node(state: PipelineState) -> dict:
         )
     human = HumanMessage(content="\n\n".join(parts))
     response = await llm.ainvoke([system, human])
+    _log("planner: plan ready")
     return {"plan": response.content}
 
 
@@ -270,6 +290,8 @@ def route_after_gate(state: PipelineState) -> Literal["coder", "planner", "abort
 
 
 async def coder_node(state: PipelineState) -> dict:
+    round_no = state.get("review_round", 0) + 1
+    _log(f"coder: writing {state['file_path']} (attempt {round_no})...")
     system = cached_system_message(load_instructions("coder"))
     parts = [
         f"Issue:\n{state['issue_summary']}",
@@ -284,10 +306,12 @@ async def coder_node(state: PipelineState) -> dict:
         )
     human = HumanMessage(content="\n\n".join(parts))
     response = await llm.ainvoke([system, human])
+    _log("coder: attempt ready, sending to reviewer")
     return {"code": response.content}
 
 
 async def reviewer_node(state: PipelineState) -> dict:
+    _log("reviewer: checking the attempt against the issue and plan...")
     system = cached_system_message(load_instructions("reviewer"))
     human = HumanMessage(
         content=(
@@ -300,9 +324,14 @@ async def reviewer_node(state: PipelineState) -> dict:
     text = response.content
     first_line, _, rest = text.partition("\n")
     verdict = "approve" if "APPROVE" in first_line.upper() else "reject"
+    feedback = rest.strip()
+    if verdict == "approve":
+        _log("reviewer: APPROVE -- proceeding to open the PR")
+    else:
+        _log(f"reviewer: REJECT -- {feedback}")
     return {
         "review_verdict": verdict,
-        "review_feedback": rest.strip(),
+        "review_feedback": feedback,
         "review_round": state.get("review_round", 0) + 1,
     }
 
@@ -322,19 +351,24 @@ async def open_pr_node(state: PipelineState) -> dict:
     repo_path = Path(state["repo_path"])
     branch_name = f"agent/issue-{state['issue_number']}"
 
+    _log(f"git: checking out {state['base_branch']} and pulling latest...")
     _run_git(repo_path, "checkout", state["base_branch"])
     _run_git(repo_path, "pull", "origin", state["base_branch"])
+    _log(f"git: branching to {branch_name}...")
     _run_git(repo_path, "checkout", "-b", branch_name)
 
     code = _strip_code_fence(state["code"])
     target = repo_path / state["file_path"]
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(code)
+    _log(f"git: committing and pushing {state['file_path']}...")
 
     _run_git(repo_path, "add", state["file_path"])
     _run_git(repo_path, "commit", "-m", f"#{state['issue_number']}: automated fix")
     _run_git(repo_path, "push", "-u", "origin", branch_name)
+    _log(f"git: pushed {branch_name}")
 
+    _log("github: opening the draft PR...")
     pr_raw = await TOOLS["create_pull_request"].ainvoke(
         {
             "owner": state["pr_owner"],
@@ -349,7 +383,9 @@ async def open_pr_node(state: PipelineState) -> dict:
         }
     )
     pr_url = _extract_pr_url(pr_raw)
+    _log(f"github: PR opened: {pr_url}")
 
+    _log(f"github: commenting the PR link back on issue #{state['issue_number']}...")
     await TOOLS["add_issue_comment"].ainvoke(
         {
             "owner": state["pr_owner"],
@@ -359,13 +395,15 @@ async def open_pr_node(state: PipelineState) -> dict:
         }
     )
 
-    if "update_issue" in TOOLS:
+    if "issue_write" in TOOLS:
         try:
+            _log(f"github: applying the {IN_REVIEW_LABEL!r} label (best-effort)...")
             # Re-fetch so we merge into whatever labels are on the issue
-            # right now instead of overwriting them -- update_issue's
+            # right now instead of overwriting them -- issue_write's
             # labels field replaces the full set, it doesn't append.
-            fresh_raw = await TOOLS["get_issue"].ainvoke(
+            fresh_raw = await TOOLS["issue_read"].ainvoke(
                 {
+                    "method": "get",
                     "owner": state["pr_owner"],
                     "repo": state["pr_repo"],
                     "issue_number": state["issue_number"],
@@ -377,22 +415,27 @@ async def open_pr_node(state: PipelineState) -> dict:
                 for label in fresh.get("labels", [])
             ]
             if IN_REVIEW_LABEL not in current_labels:
-                await TOOLS["update_issue"].ainvoke(
+                await TOOLS["issue_write"].ainvoke(
                     {
+                        "method": "update",
                         "owner": state["pr_owner"],
                         "repo": state["pr_repo"],
                         "issue_number": state["issue_number"],
                         "labels": current_labels + [IN_REVIEW_LABEL],
                     }
                 )
-        except Exception:
-            pass  # best-effort -- the PR + comment already happened
+        except Exception as exc:
+            _log(f"github: label step failed, skipping (best-effort): {exc}")
 
     return {"pr_url": pr_url}
 
 
 # --- reviewer never converged: tell the issue, touch nothing on GitHub ---
 async def flag_for_human_node(state: PipelineState) -> dict:
+    _log(
+        f"review never converged after {state['review_round']} round(s) -- "
+        "commenting on the issue, no branch or PR created"
+    )
     await TOOLS["add_issue_comment"].ainvoke(
         {
             "owner": state["pr_owner"],
@@ -410,6 +453,10 @@ async def flag_for_human_node(state: PipelineState) -> dict:
 
 # --- plan never approved by YOU: tell the issue, touch nothing on GitHub ---
 async def plan_rejected_node(state: PipelineState) -> dict:
+    _log(
+        f"plan rejected {state['plan_round']} time(s) and never approved -- "
+        "commenting on the issue, no code was written"
+    )
     await TOOLS["add_issue_comment"].ainvoke(
         {
             "owner": state["pr_owner"],
@@ -502,13 +549,12 @@ async def main():
     # <-- the issue and repo go here --
     result = await run_with_console_approval(
         {
-            "pr_owner": "your-org",
-            "pr_repo": "your-repo",
-            "issue_number": 123,  # change to a real issue number
-            "repo_path": "/path/to/local/clone",  # existing checkout with
-            # an `origin` remote you already have push access to
+            "pr_owner": "szangaro",
+            "pr_repo": "pipeline-test",
+            "issue_number": 3,
+            "repo_path": "C:/code/pipeline-test",
             "base_branch": "main",
-            "file_path": "src/example.py",  # which file the fix touches --
+            "file_path": "src/goodbye.py",  # which file the fix touches --
             # locating this automatically from the issue alone (code
             # search, stack-trace parsing) is a separate, harder problem
             # not solved here; this takes it as a given on purpose.

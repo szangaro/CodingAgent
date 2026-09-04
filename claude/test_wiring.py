@@ -1,7 +1,7 @@
 """
 Verifies pipeline.py's wiring end to end without spending real API calls
 or touching real GitHub: fakes the LLM and the four remaining MCP tools
-(get_issue, add_issue_comment, create_pull_request, update_issue), but
+(issue_read, add_issue_comment, create_pull_request, issue_write), but
 exercises real git against a throwaway local repo + bare "origin" for
 every branch/commit/push step -- proof those really are plain git now,
 not an API call in disguise. Drives the interrupt with Command(resume=...)
@@ -77,8 +77,9 @@ def json_block(obj):
 
 
 def make_fake_tools(calls):
-    def get_issue(args):
-        calls.append(("get_issue", args))
+    def issue_read(args):
+        assert args["method"] == "get"
+        calls.append(("issue_read", args))
         return json_block(
             {
                 "number": args["issue_number"],
@@ -96,15 +97,16 @@ def make_fake_tools(calls):
         calls.append(("add_issue_comment", args))
         return json_block({"ok": True})
 
-    def update_issue(args):
-        calls.append(("update_issue", args))
+    def issue_write(args):
+        assert args["method"] == "update"
+        calls.append(("issue_write", args))
         return json_block({"ok": True})
 
     return {
-        "get_issue": FakeTool("get_issue", get_issue),
+        "issue_read": FakeTool("issue_read", issue_read),
         "create_pull_request": FakeTool("create_pull_request", create_pull_request),
         "add_issue_comment": FakeTool("add_issue_comment", add_issue_comment),
-        "update_issue": FakeTool("update_issue", update_issue),
+        "issue_write": FakeTool("issue_write", issue_write),
     }
 
 
@@ -191,14 +193,14 @@ async def test_approve_plan_then_approve_review_opens_pr():
 
         tool_names = [name for name, _ in calls]
         assert tool_names == [
-            "get_issue",  # fetch_context
+            "issue_read",  # fetch_context
             "create_pull_request",
             "add_issue_comment",
-            "get_issue",  # re-fetched to merge labels
-            "update_issue",
+            "issue_read",  # re-fetched to merge labels
+            "issue_write",
         ]
 
-        # the pre-existing "bug" label survives -- update_issue REPLACES
+        # the pre-existing "bug" label survives -- issue_write REPLACES
         # the full label set, so open_pr_node has to merge, not clobber
         update_args = calls[-1][1]
         assert update_args["labels"] == ["bug", "in review"]
@@ -229,7 +231,7 @@ async def test_plan_rejected_to_max_never_touches_git_or_github():
 
         assert rounds == pl.MAX_PLAN_ROUNDS
         assert fake.coder_calls == 0
-        assert [n for n, _ in calls] == ["get_issue", "add_issue_comment"]
+        assert [n for n, _ in calls] == ["issue_read", "add_issue_comment"]
         assert "agent/issue-1" not in _git(work, "branch", "--list")
         assert "agent/issue-1" not in _git(origin, "branch", "--list")
         print("PASS: plan rejected to the cap -> zero coder calls, no git branch, one issue comment")
