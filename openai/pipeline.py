@@ -186,8 +186,9 @@ class PipelineState(TypedDict):
 # (no LLM involved -- we already know exactly which issue/file, there's
 # nothing to decide) ---
 async def fetch_context_node(state: PipelineState) -> dict:
-    issue_raw = await TOOLS["get_issue"].ainvoke(
+    issue_raw = await TOOLS["issue_read"].ainvoke(
         {
+            "method": "get",
             "owner": state["pr_owner"],
             "repo": state["pr_repo"],
             "issue_number": state["issue_number"],
@@ -340,13 +341,14 @@ async def open_pr_node(state: PipelineState) -> dict:
         }
     )
 
-    if "update_issue" in TOOLS:
+    if "issue_write" in TOOLS:
         try:
             # Re-fetch so we merge into whatever labels are on the issue
-            # right now instead of overwriting them -- update_issue's
+            # right now instead of overwriting them -- issue_write's
             # labels field replaces the full set, it doesn't append.
-            fresh_raw = await TOOLS["get_issue"].ainvoke(
+            fresh_raw = await TOOLS["issue_read"].ainvoke(
                 {
+                    "method": "get",
                     "owner": state["pr_owner"],
                     "repo": state["pr_repo"],
                     "issue_number": state["issue_number"],
@@ -358,8 +360,9 @@ async def open_pr_node(state: PipelineState) -> dict:
                 for label in fresh.get("labels", [])
             ]
             if IN_REVIEW_LABEL not in current_labels:
-                await TOOLS["update_issue"].ainvoke(
+                await TOOLS["issue_write"].ainvoke(
                     {
+                        "method": "update",
                         "owner": state["pr_owner"],
                         "repo": state["pr_repo"],
                         "issue_number": state["issue_number"],

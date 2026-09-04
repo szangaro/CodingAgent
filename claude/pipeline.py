@@ -51,13 +51,15 @@ it doesn't change.
 
 Tool-name provenance (so nothing here is a guess): reading the file,
 branching, and pushing are all plain `git` -- no MCP tool involved. The
-GitHub MCP tool names used (get_issue, add_issue_comment,
-create_pull_request, update_issue) were checked against the current
-github-mcp-server README, not assumed from an older API shape. One thing
-that's best-effort rather than guaranteed: applying an "in review" label
-after the PR opens -- it re-fetches current labels and merges rather than
-overwriting them, but update_issue's exact label semantics can vary by
-server version, so it's silently skipped if the call fails.
+GitHub MCP tool names used (issue_read with method="get",
+add_issue_comment, create_pull_request, issue_write with method="update")
+were confirmed by actually listing the live server's tools and their
+input schemas, not assumed from docs or an older API shape -- issue_read
+and issue_write are themselves a consolidation of what used to be
+separate get_issue/update_issue-style tools. One thing that's best-effort
+rather than guaranteed: applying an "in review" label after the PR opens
+-- it re-fetches current labels and merges rather than overwriting them,
+but is silently skipped if the call fails.
 """
 
 import asyncio
@@ -204,8 +206,9 @@ class PipelineState(TypedDict):
 # (no LLM involved -- we already know exactly which issue/file, there's
 # nothing to decide) ---
 async def fetch_context_node(state: PipelineState) -> dict:
-    issue_raw = await TOOLS["get_issue"].ainvoke(
+    issue_raw = await TOOLS["issue_read"].ainvoke(
         {
+            "method": "get",
             "owner": state["pr_owner"],
             "repo": state["pr_repo"],
             "issue_number": state["issue_number"],
@@ -359,13 +362,14 @@ async def open_pr_node(state: PipelineState) -> dict:
         }
     )
 
-    if "update_issue" in TOOLS:
+    if "issue_write" in TOOLS:
         try:
             # Re-fetch so we merge into whatever labels are on the issue
-            # right now instead of overwriting them -- update_issue's
+            # right now instead of overwriting them -- issue_write's
             # labels field replaces the full set, it doesn't append.
-            fresh_raw = await TOOLS["get_issue"].ainvoke(
+            fresh_raw = await TOOLS["issue_read"].ainvoke(
                 {
+                    "method": "get",
                     "owner": state["pr_owner"],
                     "repo": state["pr_repo"],
                     "issue_number": state["issue_number"],
@@ -377,8 +381,9 @@ async def open_pr_node(state: PipelineState) -> dict:
                 for label in fresh.get("labels", [])
             ]
             if IN_REVIEW_LABEL not in current_labels:
-                await TOOLS["update_issue"].ainvoke(
+                await TOOLS["issue_write"].ainvoke(
                     {
+                        "method": "update",
                         "owner": state["pr_owner"],
                         "repo": state["pr_repo"],
                         "issue_number": state["issue_number"],
@@ -502,13 +507,12 @@ async def main():
     # <-- the issue and repo go here --
     result = await run_with_console_approval(
         {
-            "pr_owner": "your-org",
-            "pr_repo": "your-repo",
-            "issue_number": 123,  # change to a real issue number
-            "repo_path": "/path/to/local/clone",  # existing checkout with
-            # an `origin` remote you already have push access to
+            "pr_owner": "szangaro",
+            "pr_repo": "pipeline-test",
+            "issue_number": 1,
+            "repo_path": "C:/code/pipeline-test",
             "base_branch": "main",
-            "file_path": "src/example.py",  # which file the fix touches --
+            "file_path": "src/hello.py",  # which file the fix touches --
             # locating this automatically from the issue alone (code
             # search, stack-trace parsing) is a separate, harder problem
             # not solved here; this takes it as a given on purpose.
